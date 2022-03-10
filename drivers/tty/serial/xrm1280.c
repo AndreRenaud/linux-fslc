@@ -313,12 +313,19 @@ struct xrm1280_devtype {
 	int	nr_uart;
 };
 
+#define XRM1280_FLAGS_SET_MCTRL (1 << 0)
+#define XRM1280_FLAGS_IER_CLEAR (1 << 1)
+#define XRM1280_FLAGS_SHUTDOWN (1 << 1)
+
 struct xrm1280_one {
 	struct uart_port		port;
 	struct work_struct		tx_work;
 	struct work_struct		md_work;
 
 	struct serial_rs485		rs485;
+
+	u32 flags;
+	u8 ier;
 };
 
 struct xrm1280_port {
@@ -695,9 +702,9 @@ static void xrm1280_stop_rx(struct uart_port* port)
 	struct xrm1280_one *one = to_xrm1280_one(port, port);
 
 	one->port.read_status_mask &= ~XRM1280_LSR_DR_BIT;
-	xrm1280_port_update(port, XRM1280_IER_REG,
-			      XRM1280_LSR_DR_BIT,
-			      0);
+	one->flags |= XRM1280_FLAGS_IER_CLEAR;
+	one->ier |= XRM1280_LSR_DR_BIT;
+	schedule_work(&one->md_work);
 }
 
 static void xrm1280_start_tx(struct uart_port *port)
@@ -750,15 +757,31 @@ static void xrm1280_md_proc(struct work_struct *ws)
 {
 	struct xrm1280_one *one = to_xrm1280_one(ws, md_work);
 
-	xrm1280_port_update(&one->port, XRM1280_MCR_REG,
+	if (one->flags & XRM1280_FLAGS_IER_CLEAR) {
+		xrm1280_port_update(&one->port, XRM1280_IER_REG, one->ier, 0);
+		one->ier = 0;
+	}
+	if (one->flags & XRM1280_FLAGS_SHUTDOWN) {
+		/* Disable TX/RX */
+		xrm1280_port_write(&one->port, XRM1280_EFCR_REG,
+			     XRM1280_EFCR_RXDISABLE_BIT |
+			     XRM1280_EFCR_TXDISABLE_BIT);
+
+		xrm1280_power(&one->port, 0);
+	}
+	if (one->flags & XRM1280_FLAGS_SET_MCTRL)
+		xrm1280_port_update(&one->port, XRM1280_MCR_REG,
 			      XRM1280_MCR_LOOP_BIT,
 			      (one->port.mctrl & TIOCM_LOOP) ?
 				      XRM1280_MCR_LOOP_BIT : 0);
+	one->flags = 0;
 }
 
 static void xrm1280_set_mctrl(struct uart_port *port, unsigned int mctrl)
 {
 	struct xrm1280_one *one = to_xrm1280_one(port, port);
+
+	one->flags |= XRM1280_FLAGS_SET_MCTRL;
 
 	schedule_work(&one->md_work);
 }
@@ -979,14 +1002,13 @@ static int xrm1280_startup(struct uart_port *port)
 
 static void xrm1280_shutdown(struct uart_port *port)
 {
-	/* Disable all interrupts */
-	xrm1280_port_write(port, XRM1280_IER_REG, 0);
-	/* Disable TX/RX */
-	xrm1280_port_write(port, XRM1280_EFCR_REG,
-			     XRM1280_EFCR_RXDISABLE_BIT |
-			     XRM1280_EFCR_TXDISABLE_BIT);
+	struct xrm1280_one *one = to_xrm1280_one(port, port);
 
-	xrm1280_power(port, 0);
+	/* Disable all interrupts */
+	one->ier = 0xff;
+	one->flags |= XRM1280_FLAGS_SHUTDOWN | XRM1280_FLAGS_IER_CLEAR;
+
+	schedule_work(&one->md_work);
 }
 
 static const char *xrm1280_type(struct uart_port *port)
