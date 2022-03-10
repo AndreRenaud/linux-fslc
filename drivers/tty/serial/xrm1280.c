@@ -16,7 +16,7 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/gpio.h>
-#include <linux/i2c.h>
+//#include <linux/i2c.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_device.h>
@@ -28,7 +28,8 @@
 #include <linux/tty_flip.h>
 #include <linux/uaccess.h>
 
-#define ANDRE(a,b...) pr_err("ANDRE:%s:%d: " a "\n", __FUNCTION__, __LINE__ , ##b)
+//#define ANDRE(a,b...) pr_err("ANDRE:%s:%d: " a "\n", __FUNCTION__, __LINE__ , ##b)
+#define ANDRE(a,b...) do {} while(0)
 
 //#ifdef CONFIG_GPIOLIB
 //#undef CONFIG_GPIOLIB
@@ -74,6 +75,7 @@
 /* Special Register set: Only if ((LCR[7] == 1) && (LCR != 0xBF)) */
 #define XRM1280_DLL_REG		(0x00) /* Divisor Latch Low */
 #define XRM1280_DLH_REG		(0x01) /* Divisor Latch High */
+#define XRM1280_DLD_REG     (0x02) /* Divisor Fractional */
 
 /* Enhanced Register set: Only if (LCR == 0xBF) */
 #define XRM1280_EFR_REG		(0x02) /* Enhanced Features */
@@ -302,8 +304,8 @@
 						  */
 
 /* Misc definitions */
-#define XRM1280_FIFO_SIZE		(64)
-#define XRM1280_REG_SHIFT		2
+#define XRM1280_INTERNAL_FIFO_SIZE	(128) /* Size of the RX/TX fifos in the XRM1280 */
+#define XRM1280_REG_SHIFT		3
 
 struct xrm1280_devtype {
 	char	name[10];
@@ -328,7 +330,6 @@ struct xrm1280_port {
 #ifdef CONFIG_GPIOLIB
 	struct gpio_chip		gpio;
 #endif
-	unsigned char			buf[XRM1280_FIFO_SIZE];
 	struct xrm1280_one		p[0];
 };
 
@@ -357,7 +358,6 @@ static void xrm1280_port_update(struct uart_port *port, u8 reg,
 				  u8 mask, u8 val)
 {
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
-
 	regmap_update_bits(s->regmap,
 			   (reg << XRM1280_REG_SHIFT) | port->line,
 			   mask, val);
@@ -449,6 +449,7 @@ static int xrm1280_set_baud(struct uart_port *port, int baud)
 	regcache_cache_bypass(s->regmap, true);
 	xrm1280_port_write(port, XRM1280_DLH_REG, div / 256);
 	xrm1280_port_write(port, XRM1280_DLL_REG, div % 256);
+	ANDRE("dld: 0x%x", xrm1280_port_read(port, XRM1280_DLD_REG));
 	ANDRE("baud:%d msb:%lu lsb=%lu lcr:%d\n",baud,div / 256,div % 256,lcr);
 	
 	regcache_cache_bypass(s->regmap, false);
@@ -459,13 +460,15 @@ static int xrm1280_set_baud(struct uart_port *port, int baud)
 	return DIV_ROUND_CLOSEST(clk / 16, div);
 }
 
-static void xrm1280_handle_rx(struct uart_port *port, unsigned int rxlen,
+static void xrm1280_handle_rx(struct uart_port *port, unsigned long rxlen,
 				unsigned int iir)
 {
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
 	unsigned int lsr = 0, ch, flag, bytes_read, i;
 	bool read_lsr = (iir == XRM1280_IIR_RLSE_SRC) ? true : false;
+	u8 buf[XRM1280_INTERNAL_FIFO_SIZE];
 
+#if 0
 	if (unlikely(rxlen >= sizeof(s->buf))) {
 		dev_warn_ratelimited(port->dev,
 				     "Port %i: Possible RX FIFO overrun: %d\n",
@@ -474,6 +477,7 @@ static void xrm1280_handle_rx(struct uart_port *port, unsigned int rxlen,
 		/* Ensure sanity of RX level */
 		rxlen = sizeof(s->buf);
 	}
+#endif
 
 	while (rxlen) {
 		/* Only read lsr if there are possible errors in FIFO */
@@ -485,19 +489,19 @@ static void xrm1280_handle_rx(struct uart_port *port, unsigned int rxlen,
 			lsr = 0;
 
 		if (read_lsr) {
-			s->buf[0] = xrm1280_port_read(port, XRM1280_RHR_REG);
+			buf[0] = xrm1280_port_read(port, XRM1280_RHR_REG);
 			bytes_read = 1;
 		} else {
+			bytes_read = min(rxlen, sizeof(buf));
 			regcache_cache_bypass(s->regmap, true);
-			regmap_raw_read(s->regmap, XRM1280_RHR_REG,
-					s->buf, rxlen);
+			regmap_raw_read(s->regmap, XRM1280_RHR_REG << XRM1280_REG_SHIFT,
+					buf, bytes_read);
 			regcache_cache_bypass(s->regmap, false);
-			bytes_read = rxlen;
 		}
 
 		lsr &= XRM1280_LSR_BRK_ERROR_MASK;
 
-		port->icount.rx++;
+		port->icount.rx += bytes_read;
 		flag = TTY_NORMAL;
 
 		if (unlikely(lsr)) {
@@ -523,8 +527,10 @@ static void xrm1280_handle_rx(struct uart_port *port, unsigned int rxlen,
 				flag = TTY_OVERRUN;
 		}
 
+		ANDRE("f=0x%x br=%d lsr=0x%x", flag, bytes_read, lsr);
 		for (i = 0; i < bytes_read; ++i) {
-			ch = s->buf[i];
+			ch = buf[i];
+			ANDRE("%d:%c", i, ch);
 			if (uart_handle_sysrq_char(port, ch))
 				continue;
 
@@ -545,6 +551,8 @@ static void xrm1280_handle_tx(struct uart_port *port)
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
 	struct circ_buf *xmit = &port->state->xmit;
 	unsigned int txlen, to_send, i;
+	char buf[XRM1280_INTERNAL_FIFO_SIZE];
+
   	if (unlikely(port->x_char)) {
 		xrm1280_port_write(port, XRM1280_THR_REG, port->x_char);
 		port->icount.tx++;
@@ -560,23 +568,26 @@ static void xrm1280_handle_tx(struct uart_port *port)
 	if (likely(to_send)) {
 		/* Limit to size of TX FIFO */
 		#if 1
-		xrm1280_port_write(port, XRM1280_EMSR_REG,1);// read tx_fifo counter
+		xrm1280_port_write(port, XRM1280_EMSR_REG, 1);// read tx_fifo counter
 		txlen = xrm1280_port_read(port, XRM1280_FC_REG);
 	   	#else
 		txlen = xrm1280_port_read(port, XRM1280_TXLVL_REG);
 		#endif
-		to_send = (to_send > txlen) ? txlen : to_send;
+		ANDRE("txlen:%d -> %d",txlen, XRM1280_INTERNAL_FIFO_SIZE - txlen);
+		txlen = XRM1280_INTERNAL_FIFO_SIZE - txlen;
+		to_send = min(txlen, to_send);
 
 		/* Add data to send */
 		port->icount.tx += to_send;
 
 		/* Convert to linear buffer */
 		for (i = 0; i < to_send; ++i) {
-			s->buf[i] = xmit->buf[xmit->tail];
+			buf[i] = xmit->buf[xmit->tail];
+			ANDRE("%d:%c", i, buf[i]);
 			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
 		}
 		regcache_cache_bypass(s->regmap, true);
-		regmap_raw_write(s->regmap, XRM1280_THR_REG, s->buf, to_send);
+		regmap_raw_write(s->regmap, XRM1280_THR_REG << XRM1280_REG_SHIFT, buf, to_send);
 		regcache_cache_bypass(s->regmap, false);
 	}
 
@@ -604,14 +615,17 @@ static void xrm1280_port_irq(struct xrm1280_port *s, int portno)
 		case XRM1280_IIR_XOFFI_SRC:
 		#if 1
 		regcache_cache_bypass(s->regmap, true);
-		xrm1280_port_write(port, XRM1280_EMSR_REG,0);//set FCTR[7] = 0 for read rx_fifo counter
+		xrm1280_port_write(port, XRM1280_EMSR_REG, 0);//set FCTR[7] = 0 for read rx_fifo counter
 		rxlen = xrm1280_port_read(port, XRM1280_FC_REG);
 		regcache_cache_bypass(s->regmap, false);
 		#else
 			rxlen = xrm1280_port_read(port, XRM1280_RXLVL_REG);
 		#endif
-			if (rxlen)
+			if (rxlen) {
+				mutex_lock(&s->mutex);
 				xrm1280_handle_rx(port, rxlen, iir);
+				mutex_unlock(&s->mutex);
+			}
 			break;
 
 		case XRM1280_IIR_CTSRTS_SRC:
@@ -837,7 +851,7 @@ static void xrm1280_set_termios(struct uart_port *port,
 	/* Get baud rate generator configuration */
 	baud = uart_get_baud_rate(port, termios, old,
 				  port->uartclk / 16 / 4 / 0xffff,
-				  port->uartclk / 16);
+				  port->uartclk);
 
 	/* Setup baudrate generator */
 	baud = xrm1280_set_baud(port, baud);
@@ -1089,14 +1103,13 @@ static int xrm1280_gpio_direction_output(struct gpio_chip *chip,
 
 static int xrm1280_probe(struct device *dev,
 			   const struct xrm1280_devtype *devtype,
-			   struct regmap *regmap, int irq, unsigned long flags)
+			   struct regmap *regmap, int irq)
 {
 	unsigned long freq, *pfreq = dev_get_platdata(dev);
 	int i, ret;
 	struct xrm1280_port *s;
 	u32 uartclk = 0;
 
-	ANDRE("");
   	if (IS_ERR(regmap))
 		return PTR_ERR(regmap);
 
@@ -1114,7 +1127,6 @@ static int xrm1280_probe(struct device *dev,
 
  	s->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(s->clk)) {
-		ANDRE("clock err pfreq=%p uartclk:%d",pfreq, uartclk);
 		if (uartclk)
 			freq = uartclk;
 		if (pfreq)
@@ -1124,7 +1136,6 @@ static int xrm1280_probe(struct device *dev,
 	}
 	if (!freq)
 		return PTR_ERR(s->clk);
-	ANDRE("freq: %lu", freq);
 
 	s->regmap = regmap;
 	s->devtype = devtype;
@@ -1161,14 +1172,13 @@ static int xrm1280_probe(struct device *dev,
 
 	mutex_init(&s->mutex);
 
-	ANDRE("nr_uart: %d", devtype->nr_uart);
 	for (i = 0; i < devtype->nr_uart; ++i) {
 		/* Initialize port data */
 		s->p[i].port.line	= i;
 		s->p[i].port.dev	= dev;
 		s->p[i].port.irq	= irq;
 		s->p[i].port.type	= PORT_XRM1280;
-		s->p[i].port.fifosize	= XRM1280_FIFO_SIZE;
+		s->p[i].port.fifosize	= 128;
 		s->p[i].port.flags	= UPF_FIXED_TYPE | UPF_LOW_LATENCY;
 		s->p[i].port.iotype	= UPIO_PORT;
 		s->p[i].port.uartclk	= freq;
@@ -1191,12 +1201,15 @@ static int xrm1280_probe(struct device *dev,
     
 	/* Setup interrupt */
 	ret = devm_request_threaded_irq(dev, irq, NULL, xrm1280_ist,
-					IRQF_ONESHOT | IRQF_TRIGGER_FALLING | flags, dev_name(dev), s);
+					IRQF_ONESHOT | IRQF_TRIGGER_LOW, dev_name(dev), s);
 	//printk("xrm1280_probe devm_request_threaded_irq =%d\n",ret);
 	
-	if (!ret)
-		return 0;
+	if (ret != 0)
+		goto out_mutex;
 
+	return 0;
+
+out_mutex:
 	mutex_destroy(&s->mutex);
 
 #ifdef CONFIG_GPIOLIB
@@ -1247,19 +1260,20 @@ static const struct of_device_id __maybe_unused xrm1280_dt_ids[] = {
 MODULE_DEVICE_TABLE(of, xrm1280_dt_ids);
 
 static struct regmap_config regcfg = {
-	.reg_bits = 7,
-	.pad_bits = 1,
+	.reg_bits = 8,
+	.pad_bits = 0,
 	.val_bits = 8,
+	.read_flag_mask = 0x80,
 	.cache_type = REGCACHE_RBTREE,
 	.volatile_reg = xrm1280_regmap_volatile,
 	.precious_reg = xrm1280_regmap_precious,
 };
 
+#if 0
 static int xrm1280_i2c_probe(struct i2c_client *i2c,
 			       const struct i2c_device_id *id)
 {
 	struct xrm1280_devtype *devtype;
-	unsigned long flags = 0;
 	struct regmap *regmap;
 	int ret;
    	if (i2c->dev.of_node) {
@@ -1269,13 +1283,12 @@ static int xrm1280_i2c_probe(struct i2c_client *i2c,
 		devtype = (struct xrm1280_devtype *)of_id->data;
 	} else {
 		devtype = (struct xrm1280_devtype *)id->driver_data;
-		flags = IRQF_TRIGGER_FALLING;
 	}
 
 	regcfg.max_register = (0xf << XRM1280_REG_SHIFT) |
 			      (devtype->nr_uart - 1);
 	regmap = devm_regmap_init_i2c(i2c, &regcfg);
-	ret = xrm1280_probe(&i2c->dev, devtype, regmap, i2c->irq, flags);
+	ret = xrm1280_probe(&i2c->dev, devtype, regmap, i2c->irq);
 	return ret;
 }
 
@@ -1302,6 +1315,7 @@ static struct i2c_driver xrm1280_i2c_uart_driver = {
 };
 module_i2c_driver(xrm1280_i2c_uart_driver);
 MODULE_ALIAS("i2c:xrm1280");
+#endif
 
 static int xrm1280_spi_probe(struct spi_device *spi)
 {
@@ -1309,18 +1323,14 @@ static int xrm1280_spi_probe(struct spi_device *spi)
 	struct regmap *regmap;
 	int ret;
 
-	ANDRE("");
-
 	/* Setup SPI bus */
 	spi->bits_per_word	= 8;
 	/* only supports mode 0 on XRM1280 */
 	spi->mode		= spi->mode ? : SPI_MODE_0;
 	spi->max_speed_hz	= spi->max_speed_hz ? : 15000000;
 	ret = spi_setup(spi);
-	if (ret) {
-		ANDRE("spi_setup: %d", ret);
+	if (ret)
 		return ret;
-	}
 
 	if (spi->dev.of_node) {
 		devtype = device_get_match_data(&spi->dev);
@@ -1336,9 +1346,7 @@ static int xrm1280_spi_probe(struct spi_device *spi)
 			      (devtype->nr_uart - 1);
 	regmap = devm_regmap_init_spi(spi, &regcfg);
 
-	ret = xrm1280_probe(&spi->dev, devtype, regmap, spi->irq, 0);
-	ANDRE("probe: %d", ret);
-	return ret;
+	return xrm1280_probe(&spi->dev, devtype, regmap, spi->irq);
 }
 
 static int xrm1280_spi_remove(struct spi_device *spi)
