@@ -150,6 +150,23 @@
 	status = "disabled";
 };
 
+
+&usbotg1 {
+	dr_mode = "host";
+	status = "okay";
+	disable-over-current;
+};
+
+
+/*
+&usbotg2 {
+	dr_mode = "host";
+	status = "okay";
+	disable-over-current;
+};
+*/
+
+
 &ecspi2 {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_espi2>;
@@ -166,7 +183,7 @@
 	xrm1280@0 {
 		compatible = "exar,xrm1280";
 		reg = <0>;
-		spi-max-frequency = <5000000>;
+		spi-max-frequency = <10000000>;
 		//spi-max-frequency = <26000000>;
 		//clock-frequency = <24000000>;
     	clock-frequency = <14745600>; // as per Y4 on the devkit

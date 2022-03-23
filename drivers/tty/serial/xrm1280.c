@@ -348,7 +348,7 @@ static u8 xrm1280_port_read(struct uart_port *port, u8 reg)
 	unsigned int val = 0;
 
 	regmap_read(s->regmap,
-		    (reg << XRM1280_REG_SHIFT) | port->line, &val);
+		    (reg << XRM1280_REG_SHIFT) | (port->line << 1), &val);
 
 	return val;
 }
@@ -358,7 +358,7 @@ static void xrm1280_port_write(struct uart_port *port, u8 reg, u8 val)
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
 
 	regmap_write(s->regmap,
-		     (reg << XRM1280_REG_SHIFT) | port->line, val);
+		     (reg << XRM1280_REG_SHIFT) | (port->line << 1), val);
 }
 
 static void xrm1280_port_update(struct uart_port *port, u8 reg,
@@ -366,7 +366,7 @@ static void xrm1280_port_update(struct uart_port *port, u8 reg,
 {
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
 	regmap_update_bits(s->regmap,
-			   (reg << XRM1280_REG_SHIFT) | port->line,
+			   (reg << XRM1280_REG_SHIFT) | (port->line << 1),
 			   mask, val);
 }
 
@@ -501,7 +501,7 @@ static void xrm1280_handle_rx(struct uart_port *port, unsigned long rxlen,
 		} else {
 			bytes_read = min(rxlen, sizeof(buf));
 			regcache_cache_bypass(s->regmap, true);
-			regmap_raw_read(s->regmap, XRM1280_RHR_REG << XRM1280_REG_SHIFT,
+			regmap_raw_read(s->regmap, (XRM1280_RHR_REG << XRM1280_REG_SHIFT) | (port->line << 1),
 					buf, bytes_read);
 			regcache_cache_bypass(s->regmap, false);
 		}
@@ -550,12 +550,13 @@ static void xrm1280_handle_rx(struct uart_port *port, unsigned long rxlen,
 		rxlen -= bytes_read;
 	}
 	
-      tty_flip_buffer_push(&port->state->port);
+	tty_flip_buffer_push(&port->state->port);
 }
 
 static void xrm1280_handle_tx(struct uart_port *port)
 {
 	struct xrm1280_port *s = dev_get_drvdata(port->dev);
+	struct xrm1280_one *one = to_xrm1280_one(port, port);
 	struct circ_buf *xmit = &port->state->xmit;
 	unsigned int txlen, to_send, i;
 	char buf[XRM1280_INTERNAL_FIFO_SIZE];
@@ -566,6 +567,9 @@ static void xrm1280_handle_tx(struct uart_port *port)
 		port->x_char = 0;
 		return;
 	}
+
+	if (one->flags & XRM1280_FLAGS_SHUTDOWN)
+		return;
 
 	if (uart_circ_empty(xmit) || uart_tx_stopped(port))
 		return;
@@ -594,7 +598,7 @@ static void xrm1280_handle_tx(struct uart_port *port)
 			xmit->tail = (xmit->tail + 1) & (UART_XMIT_SIZE - 1);
 		}
 		regcache_cache_bypass(s->regmap, true);
-		regmap_raw_write(s->regmap, XRM1280_THR_REG << XRM1280_REG_SHIFT, buf, to_send);
+		regmap_raw_write(s->regmap, (XRM1280_THR_REG << XRM1280_REG_SHIFT) | (port->line << 1), buf, to_send);
 		regcache_cache_bypass(s->regmap, false);
 	}
 
